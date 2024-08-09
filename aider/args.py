@@ -181,7 +181,7 @@ def get_parser(default_config_files, git_root):
     group.add_argument(
         "--map-tokens",
         type=int,
-        default=1024,
+        default=None,
         help="Max number of tokens to use for repo map, use 0 to disable (default: 1024)",
     )
     group.add_argument(
@@ -318,6 +318,12 @@ def get_parser(default_config_files, git_root):
         metavar="AIDERIGNORE",
         default=default_aiderignore_file,
         help="Specify the aider ignore file (default: .aiderignore in git root)",
+    )
+    group.add_argument(
+        "--subtree-only",
+        action="store_true",
+        help="Only consider files in the current subtree of the git repository",
+        default=False,
     )
     group.add_argument(
         "--auto-commits",

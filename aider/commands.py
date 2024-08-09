@@ -2,10 +2,13 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 from collections import OrderedDict
 from pathlib import Path
 
 import git
+import pyperclip
+from PIL import Image, ImageGrab
 
 from aider import models, prompts, voice
 from aider.help import Help, install_help_extra
@@ -229,11 +232,13 @@ class Commands:
 
         # If still no files, get all dirty files in the repo
         if not fnames and self.coder.repo:
-            fnames = [item.a_path for item in self.coder.repo.repo.index.diff(None)]
+            fnames = self.coder.repo.get_dirty_files()
 
         if not fnames:
             self.io.tool_error("No dirty files to lint.")
             return
+
+        fnames = [self.coder.abs_root_path(fname) for fname in fnames]
 
         lint_coder = None
         for fname in fnames:
@@ -324,7 +329,9 @@ class Commands:
                 tokens = self.coder.main_model.token_count(content)
             res.append((tokens, f"{relative_fname}", "use /drop to drop from chat"))
 
-        self.io.tool_output("Approximate context window usage, in tokens:")
+        self.io.tool_output(
+            f"Approximate context window usage for {self.coder.main_model.name}, in tokens:"
+        )
         self.io.tool_output()
 
         width = 8
@@ -340,7 +347,7 @@ class Commands:
         total_cost = 0.0
         for tk, msg, tip in res:
             total += tk
-            cost = tk * self.coder.main_model.info.get("input_cost_per_token", 0)
+            cost = tk * (self.coder.main_model.info.get("input_cost_per_token") or 0)
             total_cost += cost
             msg = msg.ljust(col_width)
             self.io.tool_output(f"${cost:7.4f} {fmt(tk)} {msg} {tip}")  # noqa: E231
@@ -348,7 +355,7 @@ class Commands:
         self.io.tool_output("=" * (width + cost_width + 1))
         self.io.tool_output(f"${total_cost:7.4f} {fmt(total)} tokens total")  # noqa: E231
 
-        limit = self.coder.main_model.info.get("max_input_tokens", 0)
+        limit = self.coder.main_model.info.get("max_input_tokens") or 0
         if not limit:
             return
 
@@ -571,16 +578,6 @@ class Commands:
                     self.coder.check_added_files()
                     added_fnames.append(matched_file)
 
-        if not added_fnames:
-            return
-
-        # only reply if there's been some chatting since the last edit
-        if not self.coder.cur_messages:
-            return
-
-        reply = prompts.added_files.format(fnames=", ".join(added_fnames))
-        return reply
-
     def completions_drop(self):
         files = self.coder.get_inchat_relative_files()
         files = [self.quote_fname(fn) for fn in files]
@@ -674,7 +671,7 @@ class Commands:
             add = result.returncode != 0
         else:
             response = self.io.prompt_ask(
-                "Add the output to the chat? (y/n/instructions): ", default="y"
+                "Add the output to the chat?\n(y/n/instructions)", default=""
             ).strip()
 
             if response.lower() in ["yes", "y"]:
@@ -789,6 +786,15 @@ class Commands:
             dict(role="user", content=user_msg),
             dict(role="assistant", content=assistant_msg),
         ]
+        self.coder.total_cost += coder.total_cost
+
+    def clone(self):
+        return Commands(
+            self.io,
+            None,
+            voice_language=self.voice_language,
+            verify_ssl=self.verify_ssl,
+        )
 
     def cmd_ask(self, args):
         "Ask questions about the code base without editing any files"
@@ -813,6 +819,7 @@ class Commands:
             dict(role="user", content=user_msg),
             dict(role="assistant", content=assistant_msg),
         ]
+        self.coder.total_cost += chat_coder.total_cost
 
     def get_help_md(self):
         "Show help about all commands in markdown"
@@ -879,6 +886,63 @@ class Commands:
             print()
 
         return text
+
+    def cmd_clipboard(self, args):
+        "Add image/text from the clipboard to the chat (optionally provide a name for the image)"
+        try:
+            # Check for image first
+            image = ImageGrab.grabclipboard()
+            if isinstance(image, Image.Image):
+                if args.strip():
+                    filename = args.strip()
+                    ext = os.path.splitext(filename)[1].lower()
+                    if ext in (".jpg", ".jpeg", ".png"):
+                        basename = filename
+                    else:
+                        basename = f"{filename}.png"
+                else:
+                    basename = "clipboard_image.png"
+
+                temp_dir = tempfile.mkdtemp()
+                temp_file_path = os.path.join(temp_dir, basename)
+                image_format = "PNG" if basename.lower().endswith(".png") else "JPEG"
+                image.save(temp_file_path, image_format)
+
+                abs_file_path = Path(temp_file_path).resolve()
+
+                # Check if a file with the same name already exists in the chat
+                existing_file = next(
+                    (f for f in self.coder.abs_fnames if Path(f).name == abs_file_path.name), None
+                )
+                if existing_file:
+                    self.coder.abs_fnames.remove(existing_file)
+                    self.io.tool_output(f"Replaced existing image in the chat: {existing_file}")
+
+                self.coder.abs_fnames.add(str(abs_file_path))
+                self.io.tool_output(f"Added clipboard image to the chat: {abs_file_path}")
+                self.coder.check_added_files()
+
+                return
+
+            # If not an image, try to get text
+            text = pyperclip.paste()
+            if text:
+                self.io.tool_output(text)
+                return text
+
+            self.io.tool_error("No image or text content found in clipboard.")
+            return
+
+        except Exception as e:
+            self.io.tool_error(f"Error processing clipboard content: {e}")
+
+    def cmd_map(self, args):
+        "Print out the current repository map"
+        repo_map = self.coder.get_repo_map()
+        if repo_map:
+            self.io.tool_output(repo_map)
+        else:
+            self.io.tool_output("No repository map available.")
 
 
 def expand_subdir(file_path):
